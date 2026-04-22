@@ -33,6 +33,6 @@ To add a script to Google Ads:
 
 ## About Take Some Risk
 
-Take Some Risk is a Vancouver-based digital marketing agency focused on paid search, shopping, and marketing measurement. We work with e-commerce and lead gen clients across Google Ads, Microsoft Ads, and Performance Max.
+Take Some Risk is a Toronto-based digital marketing agency focused on paid search, shopping, and marketing measurement. We work with e-commerce and lead gen clients across Google Ads, Microsoft Ads, and Performance Max.
 
 [takesomerisk.com](https://takesomerisk.com)
