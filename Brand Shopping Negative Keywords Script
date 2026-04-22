@@ -1,0 +1,216 @@
+/**
+ * Brand Shopping Negative Keywords Script
+ * ----------------------------------------
+ * Take Some Risk — google-ads-scripts
+ * https://github.com/bradley-tsr/google-ads-scripts
+ *
+ * WHAT IT DOES:
+ * Pulls search terms from your brand Shopping campaign and automatically adds
+ * any non-brand terms as exact match negatives to a shared negative keyword list.
+ * Keeps your brand campaign clean and properly segmented without manual review.
+ *
+ * SETUP:
+ * 1. Set ALERT_EMAIL to the address where you want script alerts sent
+ * 2. Set CAMPAIGN_ID to your brand Shopping campaign's numeric ID
+ *    (find this in the URL when viewing the campaign in Google Ads)
+ * 3. Set BRANDED_KEYWORDS to an array of your brand terms (name, misspellings, abbreviations)
+ * 4. Set LIST_BASE_NAME to whatever you want the shared negative list called
+ * 5. Add this script under Tools > Bulk Actions > Scripts in Google Ads
+ * 6. Preview to test, then save and schedule weekly
+ *
+ * NOTES:
+ * - Negatives are added as exact match
+ * - Google caps shared negative keyword lists at 5,000 terms
+ *   The script handles this automatically by creating overflow lists
+ * - You'll receive an email alert when a list nears capacity or a new one is created
+ */
+
+// --- CONFIGURATION ---
+var ALERT_EMAIL = 'your@email.com';
+var CAMPAIGN_ID = 'YOUR_CAMPAIGN_ID';
+var BRANDED_KEYWORDS = ['your brand name'];
+var DATE_RANGE = 'LAST_30_DAYS';
+var LIST_BASE_NAME = 'Brand Shopping Negatives';
+var MAX_PER_LIST = 5000;
+// ---------------------
+
+function main() {
+  Logger.log('Starting brand protection negative keyword script...');
+
+  var existingNegatives = getExistingNegativesAcrossLists(LIST_BASE_NAME);
+  Logger.log('Existing negatives across all lists: ' + existingNegatives.size);
+
+  var termsToAdd = collectNonBrandSearchTerms(CAMPAIGN_ID, BRANDED_KEYWORDS, DATE_RANGE, existingNegatives);
+  Logger.log('New non-brand terms to add: ' + termsToAdd.length);
+
+  if (termsToAdd.length === 0) {
+    Logger.log('No new negatives to add. All non-brand terms are already excluded.');
+    return;
+  }
+
+  distributeAcrossLists(termsToAdd);
+  Logger.log('Done.');
+}
+
+function getExistingNegativesAcrossLists(baseListName) {
+  var existing = new Set();
+  var listsIter = AdsApp.negativeKeywordLists().get();
+
+  while (listsIter.hasNext()) {
+    var list = listsIter.next();
+    if (list.getName().indexOf(baseListName) === -1) continue;
+
+    var negIter = list.negativeKeywords().get();
+    while (negIter.hasNext()) {
+      var neg = negIter.next();
+      var text = neg.getText().replace(/[\[\]"]/g, '').toLowerCase().trim();
+      existing.add(text);
+    }
+  }
+
+  return existing;
+}
+
+function collectNonBrandSearchTerms(campaignId, brandedKeywords, dateRange, existingNegatives) {
+  var termsToAdd = [];
+  var seen = new Set();
+
+  var query =
+    "SELECT search_term_view.search_term " +
+    "FROM search_term_view " +
+    "WHERE campaign.id = '" + campaignId + "' " +
+    "AND campaign.status = 'ENABLED' " +
+    "AND ad_group.status = 'ENABLED' " +
+    "AND segments.date DURING " + dateRange;
+
+  var result = AdsApp.search(query);
+
+  while (result.hasNext()) {
+    var row = result.next();
+    var term = (row['search_term_view.search_term'] || '').toLowerCase().trim();
+
+    if (!term) continue;
+    if (existingNegatives.has(term)) continue;
+    if (seen.has(term)) continue;
+    if (isBrandedTerm(term, brandedKeywords)) continue;
+
+    seen.add(term);
+    termsToAdd.push('[' + term + ']');
+  }
+
+  return termsToAdd;
+}
+
+function isBrandedTerm(searchTerm, brandedKeywords) {
+  return brandedKeywords.some(function(keyword) {
+    return searchTerm.toLowerCase().includes(keyword.toLowerCase());
+  });
+}
+
+function distributeAcrossLists(keywords) {
+  var remaining = keywords.slice();
+  var listIndex = 1;
+
+  while (remaining.length > 0) {
+    var listName = LIST_BASE_NAME + ' ' + listIndex;
+    var list = getOrCreateList(listName);
+
+    var currentSize = list.negativeKeywords().get().totalNumEntities();
+    var available = MAX_PER_LIST - currentSize;
+
+    if (currentSize >= MAX_PER_LIST * 0.9) {
+      sendAlert(
+        'Brand Negatives — List Near Limit: ' + listName,
+        listName + ' is at ' + currentSize + ' / ' + MAX_PER_LIST + ' keywords (' + available + ' slots remaining).\n\nA new list will be created automatically when this one is full.'
+      );
+    }
+
+    if (available <= 0) {
+      Logger.log(listName + ' is full, moving to next list.');
+      listIndex++;
+      continue;
+    }
+
+    var batch = remaining.slice(0, available);
+
+    try {
+      list.addNegativeKeywords(batch);
+      applyCampaignToList(list);
+      Logger.log('Added ' + batch.length + ' keywords to ' + listName);
+      remaining = remaining.slice(batch.length);
+    } catch (e) {
+      Logger.log('Failed to add to ' + listName + ': ' + e.message);
+      sendAlert(
+        'Brand Negatives — Script Error',
+        'Failed to add keywords to ' + listName + '.\n\nError: ' + e.message
+      );
+      break;
+    }
+
+    listIndex++;
+  }
+}
+
+function getOrCreateList(listName) {
+  var listsIter = AdsApp.negativeKeywordLists()
+    .withCondition('Name = "' + listName + '"')
+    .get();
+
+  if (listsIter.hasNext()) {
+    return listsIter.next();
+  }
+
+  Logger.log('Creating new negative keyword list: ' + listName);
+  var newList = AdsApp.newNegativeKeywordListBuilder()
+    .withName(listName)
+    .build()
+    .getResult();
+
+  sendAlert(
+    'Brand Negatives — New List Created: ' + listName,
+    'A new shared negative keyword list "' + listName + '" was automatically created and applied to your brand campaign.\n\nThis means your previous list is now full. Consider auditing old terms to consolidate.'
+  );
+
+  return newList;
+}
+
+function applyCampaignToList(list) {
+  var campaign = getCampaignById(CAMPAIGN_ID);
+  if (!campaign) return;
+
+  var linkedLists = campaign.negativeKeywordLists().get();
+  while (linkedLists.hasNext()) {
+    if (linkedLists.next().getName() === list.getName()) {
+      return;
+    }
+  }
+
+  campaign.addNegativeKeywordList(list);
+  Logger.log('Applied list "' + list.getName() + '" to campaign.');
+}
+
+function getCampaignById(campaignId) {
+  var iter = AdsApp.campaigns()
+    .withCondition("campaign.id = '" + campaignId + "'")
+    .get();
+
+  if (iter.hasNext()) return iter.next();
+
+  iter = AdsApp.shoppingCampaigns()
+    .withCondition("campaign.id = '" + campaignId + "'")
+    .get();
+
+  if (iter.hasNext()) return iter.next();
+
+  Logger.log('ERROR: No campaign found with ID: ' + campaignId);
+  return null;
+}
+
+function sendAlert(subject, body) {
+  MailApp.sendEmail({
+    to: ALERT_EMAIL,
+    subject: subject,
+    body: body
+  });
+  Logger.log('Alert email sent: ' + subject);
+}
